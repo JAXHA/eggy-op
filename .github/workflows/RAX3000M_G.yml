@@ -1,0 +1,181 @@
+name: RAX3000M_G
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+  watch:
+    types: [started]
+
+env:
+  REPO_URL: https://github.com/hanwckf/immortalwrt-mt798x
+  REPO_BRANCH: openwrt-21.02
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: ./config/rax3km/rax3000m_21.02.config
+  DIY_P1_SH: ./custom/rax3km/diy-part1.sh
+  DIY_P2_SH: ./custom/rax3km/diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_COWTRANSFER: false
+  UPLOAD_WETRANSFER: false
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup base environment & essential tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          # Clean up disk space & unnecessary pre-installed stuff
+          sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+
+          sudo apt-get update -qq
+
+          # Install minimal build tools VERY early — explicit packages to avoid build-essential metapackage issues on 24.04
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ cpp make binutils dpkg-dev libc6-dev \
+            coreutils procps grep patch
+
+          # Quick verification — fail fast if critical tools are missing
+          echo "=== Verification of essential build tools ==="
+          make --version  || { echo "ERROR: make missing"; exit 1; }
+          gcc --version   || { echo "ERROR: gcc missing"; exit 1; }
+          g++ --version   || { echo "ERROR: g++ missing"; exit 1; }
+          echo "nproc: $(nproc || echo 'not available')"
+          echo "All core tools look good."
+
+          # Refresh apt cache again (safety on 24.04)
+          sudo apt-get update -qq
+
+          # Install full OpenWrt build dependencies (without build-essential to prevent candidate errors)
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext \
+            gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 \
+            libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libmpc-dev libmpfr-dev \
+            libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf \
+            python3 python3-pyelftools python3-setuptools qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget \
+            xmlto xxd zlib1g-dev
+
+          sudo apt-get autoremove --purge -y || true
+          sudo apt-get clean
+
+          sudo timedatectl set-timezone "$TZ" || true
+
+          sudo mkdir -p /workdir
+          sudo chown $(whoami):$(id -gn) /workdir
+          df -hT /workdir
+
+      - name: Install Go 1.25.6
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.6'
+          cache: false
+
+      - name: Clone source code
+        working-directory: /workdir
+        run: |
+          git clone --depth=1 $REPO_URL -b $REPO_BRANCH openwrt
+          ls -la openwrt
+
+      - name: Load custom feeds
+        run: |
+          cd /workdir/openwrt || { echo "openwrt directory missing"; ls -la /workdir; exit 1; }
+          if [ -f "$FEEDS_CONF" ] && [ "$FEEDS_CONF" != "feeds.conf.default" ]; then
+            mv "$FEEDS_CONF" feeds.conf.default
+          fi
+          chmod +x "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          "$GITHUB_WORKSPACE/$DIY_P1_SH" || exit 1
+
+      - name: Update feeds
+        run: cd /workdir/openwrt && ./scripts/feeds update -a
+
+      - name: Remove conflicting packages
+        run: |
+          cd /workdir/openwrt || exit 1
+          rm -rf \
+            ./feeds/luci/applications/luci-app-openclash \
+            ./feeds/luci/applications/luci-app-passwall \
+            ./feeds/luci/applications/luci-app-ssr-plus \
+            ./feeds/luci/applications/luci-app-alist \
+            ./feeds/packages/net/xray-core \
+            ./feeds/packages/net/xray-plugin
+
+      - name: Install feeds
+        run: cd /workdir/openwrt && ./scripts/feeds install -a
+
+      - name: Pre-download v2ray-geodata
+        working-directory: /workdir/openwrt
+        run: |
+          mkdir -p dl
+          wget -O dl/dlc.dat.$(date +%Y%m%d%H%M%S) \
+            https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat
+
+      - name: Load custom configuration
+        working-directory: /workdir/openwrt
+        run: |
+          [ -e "$GITHUB_WORKSPACE/files" ] && mv "$GITHUB_WORKSPACE/files" files
+          [ -e "$GITHUB_WORKSPACE/$CONFIG_FILE" ] && mv "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          chmod +x "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          "$GITHUB_WORKSPACE/$DIY_P2_SH"
+
+      - name: Download packages
+        working-directory: /workdir/openwrt
+        run: |
+          make defconfig
+          make download -j$(nproc 2>/dev/null || echo 4)
+
+      - name: Compile the firmware
+        working-directory: /workdir/openwrt
+        env:
+          PATH: /usr/local/go/bin:${{ env.PATH }}
+          GOTOOLCHAIN: auto
+        run: |
+          echo "=== Compile debug info ==="
+          command -v go && go version || echo "go MISSING"
+          command -v make && make --version || echo "make MISSING"
+          echo "PATH: $PATH"
+          THREADS=$(nproc 2>/dev/null || echo 1)
+          echo "Threads: $THREADS"
+          echo "Build starting..."
+          make -j$THREADS V=s || make -j1 V=s
+
+      - name: Disk usage (after build)
+        if: always()
+        run: df -hT
+
+      - name: Upload bin directory (optional)
+        uses: actions/upload-artifact@v4
+        if: env.UPLOAD_BIN_DIR == 'true' && success()
+        with:
+          name: OpenWrt_bin
+          path: /workdir/openwrt/bin
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        if: env.UPLOAD_FIRMWARE == 'true' && success()
+        with:
+          name: OpenWrt_firmware
+          path: /workdir/openwrt/bin/targets/**
+
+      # Add release creation, cowtransfer, wetransfer, etc. as in your original file
+
+      # Add your Cowtransfer, WeTransfer, Release steps here as before
+      # Example placeholder:
+      # - name: Create release
+      #   uses: softprops/action-gh-release@v2
+      #   ...
